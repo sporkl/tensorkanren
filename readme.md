@@ -1,0 +1,5 @@
+# tensorKanren
+
+*Requires:*
+- OCaml
+- Owl

@@ -1,0 +1,730 @@
+#require "owl-top"
+open Owl
+
+(* tensor whose elements form semiring *)
+module type TensorSemiring = sig
+  type elt
+  type arr
+  
+  val zeros : int array -> arr
+  val ones : int array -> arr
+
+  val sum : ?axis:int -> ?keep_dims:bool -> arr -> arr
+  val add : arr -> arr -> arr
+  val mul : arr -> arr -> arr
+  val smul : elt -> arr -> arr
+
+  val shape : arr -> int array
+  val reshape : arr -> int array -> arr
+  val concat_horizontal : arr -> arr -> arr
+
+  val print : arr -> unit
+end
+
+(* TensorSemiring with standard + and * *)
+module AddMulTensorSemiring : TensorSemiring
+  with type elt = float
+  with type arr = Arr.arr
+= struct
+
+  type elt = float
+  type arr = Arr.arr
+
+  let zeros = Arr.zeros
+  let ones = Arr.ones
+
+  let sum = Arr.sum
+  let add = Arr.add
+  let mul = Arr.mul
+  let smul = Arr.scalar_mul
+
+  let shape = Arr.shape
+  let reshape = Arr.reshape
+  let concat_horizontal = Arr.concat_horizontal
+
+  let print x = Arr.print x
+
+end
+
+(* TensorSemiring with max and add (max tropical semiring) *)
+module MaxAddTensorSemiring : TensorSemiring
+  with type elt = float
+  with type arr = Arr.arr
+= struct
+
+  type elt = float
+  type arr = Arr.arr
+
+  let zeros shape = Arr.create shape Float.neg_infinity
+  let ones = Arr.zeros
+
+  let sum = Arr.max
+  let add = Arr.max2
+  let mul = Arr.add
+  let smul = Arr.scalar_add
+
+  let shape = Arr.shape
+  let reshape = Arr.reshape
+  let concat_horizontal = Arr.concat_horizontal
+
+  let print x = Arr.print x
+
+end
+
+
+(* TensorKanren implementation with given semiring *)
+module TensorKanren(TS : TensorSemiring) = struct
+
+  (* TYPES *)
+
+  type elt = TS.elt
+  type arr = TS.arr
+  
+  (* variable types *)
+  type adt = 
+  | Unit
+  | Sum of adt * adt
+  | Prod of adt * adt
+
+  (* value types, used for output *)
+  type adv =
+  | Sole
+  | Left of adv
+  | Right of adv
+  | Pair of adv * adv
+
+  (* variable is a DeBruijn index with a type *)
+  type var = int * adt
+
+  (* expression *)
+  type tk =
+  | Succeed
+  | Fail
+  | Conj of tk * tk
+  | Disj of tk * tk
+  | Fresh of adt * tk
+  | Rel of string * (var list)
+  | Eqo of var * var
+  | Soleo of var
+  | Lefto of var * var (* a + b, a *)
+  | Righto of var * var (* a + b, b *)
+  | Pairo of var * var * var (* a * b, a, b *)
+  | Factor of TS.elt
+
+  (* relation *)
+  type rel = {
+    name: string;
+    args: adt list;
+    body: tk;
+  }
+
+  (* compiled/evaluated relation *)
+  type comp_rel = {
+    name: string;
+    args: adt list;
+    body: TS.arr;
+  }
+
+  (* program *)
+  (* eval_tk_prgm_maino function expends a program to contain a relation called "maino" *)
+  type tk_prgm = rel list
+
+  (* compiled/evaluated progam *)
+  type comp_tk_prgm = comp_rel list
+
+  (* HELPER FUNCTIONS *)
+
+  (* size of an adt *)
+  let rec adt_size (t : adt) : int =
+    match t with
+    | Unit -> 1
+    | Sum (x, y) -> (adt_size x) + (adt_size y)
+    | Prod (x, y) -> (adt_size x) * (adt_size y)
+
+  (* size of a list of adts *)
+  let env_size env =
+    List.fold_left
+      (fun acc x -> acc + (adt_size x))
+      0
+      env
+
+  (* corresponding tensor shape of a list of adts *)
+  let shape_of_env env =  Array.of_list @@ List.map adt_size env
+
+  (* like kronecker product, but tensor-shaped *)
+  let tensor_prod (a : TS.arr) (b : TS.arr) : TS.arr =
+    let a_shape = TS.shape a in
+    let b_shape = TS.shape b in
+    let a_rank = Array.length a_shape in
+    let b_rank = Array.length b_shape in
+    let a_good_rank =
+      TS.reshape
+        a
+        (Array.append a_shape (Array.init b_rank (Fun.const 1)))
+    in
+    let b_good_rank =
+      TS.reshape
+      b
+      (Array.append (Array.init a_rank (Fun.const 1)) b_shape)
+    in
+    TS.mul a_good_rank b_good_rank
+
+  (* kronecker product of vectors *)
+  let vec_kron_prod a b = TS.reshape (tensor_prod a b) [|-1|]
+
+  (* kronecker sum of vectors *)
+  let vec_kron_sum a b = TS.concat_horizontal a b
+
+  (* zero vector of length s with 1 at position n *)
+  let rec unit_basis s n =
+    match s, n with
+    | 0, _ -> TS.zeros [|0|]
+    | ss, 0 -> vec_kron_sum (TS.ones [|1|]) (unit_basis (s - 1) (n - 1))
+    | ss, sn -> vec_kron_sum (TS.zeros [|1|]) (unit_basis (s - 1) (n - 1))
+
+  (* HELPER MACROS *)
+
+  (* bool type and values *)
+  let bool_adt = Sum (Unit, Unit)
+  let true_adv = Left Sole
+  let false_adv = Right Sole
+  let true_vec = unit_basis 2 0
+  let false_vec = unit_basis 2 1
+
+  (* conjunction of a list *)
+  let rec conj (tks : tk list) : tk =
+    match tks with
+    | [] -> Succeed
+    | a :: d -> Conj (a, (conj d))
+
+  (* disjunction of a list *)
+  let rec disj (tks : tk list) : tk =
+    match tks with
+    | [] -> Fail
+    | a :: d -> Disj (a, (disj d))
+
+  (* check that a variable has a set value *)
+  let rec var_has_val (vr : var) (vl : adv) =
+    let vv, vt = vr in
+    match vt, vl with
+    | Unit, Sole -> Soleo vr
+    | Sum (lt, _rt), Left lv ->
+        Fresh (lt, Conj (Lefto ((vv + 1, vt), (0, lt)), var_has_val (0, lt) lv))
+    | Sum (_lt, rt), Right rv ->
+        Fresh (rt, Conj (Righto ((vv + 1, vt), (0, rt)), var_has_val (0, rt) rv))
+    | Prod (lt, rt), Pair (lv, rv) ->
+        Fresh (lt,
+          Fresh (rt,
+            Conj (
+              Pairo ((vv + 2, vt), (1, lt), (0, rt)),
+              Conj (
+                var_has_val (1, lt) lv,
+                var_has_val (0, rt) rv))))
+    | _ -> invalid_arg "Variable type does not match value type!"
+
+  (* sum type corresponding to nats with s as the max value *)
+  let rec nat_adt s =
+    match s with
+    | 1 -> Unit
+    | m -> Sum (Unit, nat_adt (m - 1))
+
+  (* construct value of nat n corresponding to nat_adt s *)
+  let rec nat_adv s n =
+    if n = 0 then
+      if s = 1 then
+        Sole (* built up enough successors already *)
+      else
+        Left Sole
+    else
+      Right (nat_adv (s - 1) (n - 1))
+
+  (* EVALUATION *)
+
+  (* list of possible vector states a variable can inhabit *)
+  let var_possible_states (v : var) : TS.arr list =
+    let s = adt_size (snd v) in
+    List.init s (unit_basis s)
+
+  (* enforce two variables to have a target state *)
+  let gen_single_unify
+    (target_state : TS.arr) (ab : var) (a : var) (env : adt list) (wrap : TS.arr -> TS.arr)
+    : TS.arr = 
+    List.fold_right
+      (fun v env_tensor ->
+        let v_tensor =
+          if v = ab then
+            wrap target_state
+          else if v = a then
+            target_state
+          else
+            TS.ones [|adt_size (snd v)|]
+        in
+        tensor_prod v_tensor env_tensor)
+      (List.mapi (fun i a -> (i, a)) env) (* bundle with index to treat as var *)
+      (TS.ones [||])
+
+  (* unify two variables *)
+  (* wrap should take a vector with same type as a, and convert it to fit ab *)
+  let gen_unify (ab : var) (a : var) (env : adt list) (wrap : TS.arr -> TS.arr) : TS.arr =
+    List.fold_left (* sum over possible equalities *)
+      (fun peq_sum peq ->
+        let peq_env_tensor = gen_single_unify peq ab a env wrap in
+        TS.add peq_env_tensor peq_sum)
+      (TS.zeros (shape_of_env env))
+      (var_possible_states a)
+
+  (* evaluate a tk expression by turn into a tensor *)
+  let rec eval_tk (exp : tk) (env : adt list) (rels : comp_rel list) : TS.arr =
+    match exp with
+    | Succeed ->
+        (* all-one tensor w/ env shape *)
+        TS.ones (shape_of_env env)
+    | Fail ->
+        (* all-zero tensor w/ env shape *)
+        TS.zeros (shape_of_env env);
+    | Conj (e1, e2) ->
+        (* element-wise multiplication *)
+        TS.mul (eval_tk e1 env rels) (eval_tk e2 env rels)
+    | Disj (e1, e2) ->
+        (* element-wise addition *)
+        TS.add (eval_tk e1 env rels) (eval_tk e2 env rels)
+    | Fresh (vt, body) -> 
+        (* evaluate body with new variable in environment *)
+        let body_res = eval_tk body (vt :: env) rels in
+        (* sum over the variable (designed to be axis 0) *)
+        TS.sum ~keep_dims:false ~axis:0 body_res
+    | Rel (name, args) ->
+        (* get the result of the relation, then unify it with the corresponding variables *)
+        let rel = List.find (fun r -> r.name = name) rels in
+        let nargs = List.length rel.args in
+        let args_and_env = rel.args @ env in
+        let unify_arg_tensors = 
+          List.mapi
+            (fun i a ->
+              let (ai, at) = a in
+              gen_unify (* unify *)
+                (i, at) (* rel variable at index *)
+                (ai + nargs, at) (* with argument variable w/ corrected index *)
+                args_and_env
+                Fun.id)
+            args (* (int * adt) list *)
+        in
+        let unified_args_env = (* conj the unifications for each arg and rel result *)
+          List.fold_left
+            TS.mul
+              (tensor_prod rel.body (TS.ones (shape_of_env env)))
+              unify_arg_tensors
+        in
+        List.fold_left (* sum over the rel args *)
+          (fun res_tensor _ -> TS.sum ~keep_dims:false ~axis:0 res_tensor)
+          unified_args_env
+          args
+    | Eqo (a, b) ->
+        (* unify a and b *)
+        gen_unify a b env Fun.id
+    | Soleo (n, t) ->
+        (* same as succeed, b/c guaranteed by "typechecking"*)
+        TS.ones (shape_of_env env)
+    | Lefto (ab, a) ->
+        (* check that left side matches *)
+        let (_, Sum (_at, bt)) = ab in
+        gen_unify ab a env
+          (fun va -> vec_kron_sum va (TS.zeros [|adt_size bt|]))
+    | Righto (ab, b) ->
+        (* check that right side matches *)
+        let (_, Sum (at, _bt)) = ab in
+        gen_unify ab b env
+          (fun vb -> vec_kron_sum (TS.zeros [|adt_size at|]) vb)
+    | Pairo (ab, a, b) ->
+        (* check that a and b match *)
+        let (_, Prod (at, bt)) = ab in
+        let a_check =
+          gen_unify ab a env (fun va -> vec_kron_prod va (TS.ones [|adt_size bt|]))
+        in
+        let b_check =
+          gen_unify ab b env (fun vb -> vec_kron_prod (TS.ones [|adt_size at|]) vb)
+        in
+        TS.mul a_check b_check
+    | Factor w ->
+        TS.(smul w (ones (shape_of_env env)))
+
+  let eval_rel (r : rel) (rels : comp_rel list) : comp_rel =
+    { name = r.name;
+      args = r.args;
+      body = eval_tk r.body r.args rels }
+
+  let rec eval_tk_prgm_help (prgm : rel list) (prev_comp : comp_rel list) =
+    let comp = List.map (fun r -> eval_rel r prev_comp) prgm in
+    (* print_endline "----------------------------"; *)
+    (* List.iter (fun r -> print_endline r.name; TS.print r.body; print_endline "") comp; *)
+    if comp = prev_comp then
+      comp
+    else
+      eval_tk_prgm_help prgm comp
+
+  let eval_tk_prgm (prgm : rel list) : comp_rel list =
+    let init_comp_rels =
+      List.map
+        (fun (r : rel) ->
+          { name = r.name;
+            args = r.args;
+            body = TS.zeros (shape_of_env r.args)})
+        prgm
+    in
+    eval_tk_prgm_help prgm init_comp_rels
+
+  let eval_tk_prgm_maino (prgm : rel list) : comp_rel =
+    List.find (fun r -> r.name = "maino") (eval_tk_prgm prgm)
+
+end
+
+(* EXAMPLES/TESTS *)
+
+module MaxAddTKEx = struct
+
+  module TK = TensorKanren(MaxAddTensorSemiring)
+  open TK
+
+  let ex_basic : tk_prgm = [ (* expected: Left Sole *)
+    { name = "maino";
+      args = [Sum (Unit, Unit)];
+      body =
+        Fresh (Unit,
+               conj [
+                 Lefto ((1, Sum (Unit, Unit)), (0, Unit));
+                 Soleo (0, Unit)])}]
+
+  let trueo : rel = {
+    name = "trueo";
+    args = [bool_adt];
+    body =
+      Fresh (Unit,
+             conj [
+               Lefto ((1, Sum (Unit, Unit)), (0, Unit));
+               Soleo (0, Unit)])}
+
+  let falseo : rel = {
+    name = "falseo";
+    args = [bool_adt];
+    body =
+      Fresh (Unit,
+             conj [
+               Righto ((1, Sum (Unit, Unit)), (0, Unit));
+               Soleo (0, Unit)])}
+
+  let ex_trueo : tk_prgm = [ (* expected: true_adv *)
+    trueo;
+    { name = "maino";
+      args = [bool_adt];
+      body = Rel ("trueo", [(0, bool_adt)])}]
+
+  let ex_true_or_false : tk_prgm = [ (* expected: true_adv and false_adv *)
+    trueo; falseo;
+    { name = "maino";
+      args = [bool_adt];
+      body = disj [
+        Rel ("trueo", [(0, bool_adt)]);
+        Rel ("falseo", [(0, bool_adt)])]}]
+
+  let ex_true_and_false : tk_prgm = [ (* expected: no solution *)
+    trueo; falseo;
+    {
+      name = "maino";
+      args = [bool_adt];
+      body = conj [
+        Rel ("trueo", [(0, bool_adt)]);
+        Rel ("falseo", [(0, bool_adt)])]}]
+
+  let noto : rel = { (* expects trueo and falseo to also be rels *)
+    name = "noto";
+    args = [bool_adt; bool_adt];
+    body = disj [
+        conj [
+          Rel ("falseo", [(0, bool_adt)]);
+          Rel ("trueo", [(1, bool_adt)])];
+        conj [
+          Rel ("trueo", [(0, bool_adt)]);
+          Rel ("falseo", [(1, bool_adt)])]]}
+
+  let sameo : rel = { (* expects trueo and falseo to also be rels *)
+    name = "sameo";
+    args = [bool_adt; bool_adt];
+    body = disj [
+        conj [
+          Rel ("trueo", [(0, bool_adt)]);
+          Rel ("trueo", [(1, bool_adt)])];
+        conj [
+          Rel ("falseo", [(0, bool_adt)]);
+          Rel ("falseo", [(1, bool_adt)])]]}
+
+  let ex_noto : tk_prgm = [ (* expected: true_adv *)
+    trueo; falseo; noto;
+    { name = "maino";
+      args = [bool_adt];
+      body =
+        Fresh (bool_adt,
+               conj [
+                 Rel ("falseo", [(0, bool_adt)]);
+                 Rel ("noto", [(0, bool_adt); (1, bool_adt)])])}]
+
+  let ex_noto_rev : tk_prgm = [ (* expected: true_adv *)
+    trueo; falseo; noto;
+    { name = "maino";
+      args = [bool_adt];
+      body =
+        Fresh (bool_adt,
+               conj [
+                 Rel ("falseo", [(0, bool_adt)]);
+                 Rel ("noto", [(1, bool_adt); (0, bool_adt)])])}]
+
+  let xoro : rel = { (* expects trueo, falseo, noto, sameo to be rels *)
+    name = "xoro";
+    args = [bool_adt; bool_adt; bool_adt];
+    body = disj [
+      conj [
+        Rel ("noto", [(0, bool_adt); (1, bool_adt)]);
+        Rel ("trueo", [(2, bool_adt)])];
+      conj [
+        Rel ("sameo", [(0, bool_adt); (1, bool_adt)]);
+        Rel ("falseo", [(2, bool_adt)])]]}
+
+  let ex_xoro : tk_prgm = [ (* expected: true_adv *)
+    trueo; falseo; noto; sameo; xoro;
+    { name = "maino";
+      args = [bool_adt];
+      body = 
+        Fresh (bool_adt,
+          Fresh (bool_adt,
+            conj [
+              Rel ("falseo", [(1, bool_adt)]);
+              Rel ("trueo", [(0, bool_adt)]);
+              Rel ("xoro", [(1, bool_adt); (0, bool_adt); (2, bool_adt)])]))}]
+
+  let ex_xoro_rev : tk_prgm = [ (* expected: true_adv *)
+    trueo; falseo; noto; sameo; xoro;
+    { name = "maino";
+      args = [bool_adt];
+      body = 
+        Fresh (bool_adt,
+          Fresh (bool_adt,
+            conj [
+              Rel ("falseo", [(1, bool_adt)]);
+              Rel ("trueo", [(0, bool_adt)]);
+              Rel ("xoro", [(2, bool_adt); (0, bool_adt); (1, bool_adt)])]))}]
+
+  let ex_noto_pair : tk_prgm = [ (* expected: Pair (true_adv, false_adv) and Pair (false_adv, true_adv) *)
+    trueo; falseo; noto;
+    { name = "maino";
+      args = [Prod (bool_adt, bool_adt)];
+      body = 
+        Fresh (bool_adt,
+          Fresh (bool_adt,
+            conj [
+              Pairo (
+                (2, Prod (bool_adt, bool_adt)),
+                (1, bool_adt),
+                (0, bool_adt));
+              Rel ("noto", [(1, bool_adt); (0, bool_adt)])]))}]
+
+  let ex_pair : tk_prgm = [
+    { name = "maino";
+      args = [Prod (bool_adt, bool_adt)];
+      body = Fresh (bool_adt,
+        Pairo (
+          (1, Prod (bool_adt, bool_adt)),
+          (0, bool_adt),
+          (0, bool_adt)))}]
+
+  let succeedo : rel = {
+    name = "succeedo";
+    args = [];
+    body = Succeed }
+
+  let failo : rel = {
+    name = "failo";
+    args = [];
+    body = Fail }
+
+  let ex_succeedo : tk_prgm = [
+    succeedo;
+    { name = "maino";
+      args = [Prod (bool_adt, bool_adt)];
+      body = Rel ("succeedo", [])}]
+
+  let ex_no_vars_succeed : tk_prgm = [ (* expected: 1 *)
+    succeedo;
+    { name = "maino";
+      args = [];
+      body = Rel ("succeedo", [])}]
+
+  let ex_no_vars_fail : tk_prgm = [ (* expected: 0 *)
+    failo;
+    { name = "maino";
+      args = [];
+      body = Rel ("failo", [])}]
+
+  let ex_multi_vars : tk_prgm = [ (* expected: 2 x 2 identity matrix *)
+    trueo; falseo; sameo;
+    { name = "maino";
+      args = [bool_adt; bool_adt];
+      body = Rel ("sameo", [(0, bool_adt); (1, bool_adt)])}]
+
+  let ex_contra_recursion : tk_prgm = [ (* not sure what this should return, depends on how init rels *)
+    trueo; falseo; noto; sameo; xoro;
+    { name = "maino";
+      args = [bool_adt];
+      body = Fresh (bool_adt,
+        Conj (
+          Rel ("maino", [(0, bool_adt)]),
+          Rel ("noto", [(0, bool_adt); (1, bool_adt)])))}]
+
+  let ex_var_has_val_zero : tk_prgm = [
+    { name = "maino";
+      args = [nat_adt 3];
+      body = var_has_val (0, nat_adt 3) (nat_adv 3 0) }]
+
+  let ex_var_has_val_one : tk_prgm = [
+    { name = "maino";
+      args = [nat_adt 3];
+      body = var_has_val (0, nat_adt 3) (nat_adv 3 1) }]
+
+  let ex_var_has_val_two : tk_prgm = [
+    { name = "maino";
+      args = [nat_adt 3];
+      body = var_has_val (0, nat_adt 3) (nat_adv 3 2) }]
+
+  let ex_small_transitive_closure : tk_prgm = [ 
+    { name = "grapho";
+      args = [nat_adt 3; nat_adt 3];
+      body =
+        Disj (
+          Conj (
+            var_has_val (0, nat_adt 3) (nat_adv 3 0),
+            var_has_val (1, nat_adt 3) (nat_adv 3 1)),
+          Conj (
+            var_has_val (0, nat_adt 3) (nat_adv 3 1),
+            var_has_val (1, nat_adt 3) (nat_adv 3 2))) };
+    { name = "connecto";
+      args = [nat_adt 3; nat_adt 3];
+      body = 
+        Disj (
+          Rel ("grapho", [(0, nat_adt 3); (1, nat_adt 3)]),
+          Fresh (nat_adt 3,
+            Conj (
+              Rel ("connecto", [(1, nat_adt 3); (0, nat_adt 3)]),
+              Rel ("connecto", [(0, nat_adt 3); (2, nat_adt 3)]))))};
+    { name = "maino";
+      args = [nat_adt 3; nat_adt 3];
+      body = Rel ("connecto", [(0, nat_adt 3); (1, nat_adt 3)])}]
+
+  let ex_potential_infinite_loop : tk_prgm = [
+    { name = "maino";
+      args = [];
+      body = Disj (Succeed, Rel ("maino", [])) }]
+
+  let ex_small_transitive_closure_loop : tk_prgm = [ 
+    { name = "grapho";
+      args = [nat_adt 2; nat_adt 2];
+      body =
+        disj [
+          Conj (
+            var_has_val (0, nat_adt 3) (nat_adv 3 0),
+            var_has_val (1, nat_adt 3) (nat_adv 3 1));
+          Conj (
+            var_has_val (0, nat_adt 3) (nat_adv 3 1),
+            var_has_val (1, nat_adt 3) (nat_adv 3 2));
+          Conj (
+            var_has_val (0, nat_adt 3) (nat_adv 3 2),
+            var_has_val (1, nat_adt 3) (nat_adv 3 0))]};
+    { name = "connecto";
+      args = [nat_adt 3; nat_adt 3];
+      body = 
+        Disj (
+          Rel ("grapho", [(0, nat_adt 3); (1, nat_adt 3)]),
+          Fresh (nat_adt 3,
+            Conj (
+              Rel ("connecto", [(1, nat_adt 3); (0, nat_adt 3)]),
+              Rel ("connecto", [(0, nat_adt 3); (2, nat_adt 3)]))))};
+    { name = "maino";
+      args = [nat_adt 3; nat_adt 3];
+      body = Rel ("connecto", [(0, nat_adt 3); (1, nat_adt 3)])}]
+
+  let ex_coin_flip : tk_prgm = [
+    { name = "maino";
+      args = [bool_adt];
+      body =
+        Disj (
+          Conj (
+            Factor 0.5,
+            var_has_val (0, bool_adt) true_adv),
+          Conj (
+            Factor 0.5,
+            var_has_val (0, bool_adt) false_adv)) }]
+
+  (* list of the examples *)
+
+  let examples = [
+    ("ex_basic", ex_basic);
+    ("ex_trueo", ex_trueo);
+    ("ex_true_or_false", ex_true_or_false);
+    ("ex_true_and_false", ex_true_and_false);
+    ("ex_noto", ex_noto);
+    ("ex_noto_rev", ex_noto_rev);
+    ("ex_xoro", ex_xoro);
+    ("ex_xoro_rev", ex_xoro_rev);
+    ("ex_noto_pair", ex_noto_pair);
+    ("ex_pair", ex_pair);
+    ("ex_succeedo", ex_succeedo);
+    ("ex_no_vars_succeed", ex_no_vars_succeed);
+    ("ex_no_vars_fail", ex_no_vars_fail);
+    ("ex_multi_vars", ex_multi_vars);
+    ("ex_contra_recursion", ex_contra_recursion);
+    ("ex_var_has_val_zero", ex_var_has_val_zero);
+    ("ex_var_has_val_one", ex_var_has_val_one);
+    ("ex_var_has_val_two", ex_var_has_val_two);
+    ("ex_small_transitive_closure", ex_small_transitive_closure);
+    ("ex_potential_infinite_loop", ex_potential_infinite_loop);
+    ("ex_small_transitive_closure_loop", ex_small_transitive_closure_loop);
+    ("ex_coin_flip", ex_coin_flip);
+  ]
+
+end
+
+module AddMulTKEx = struct
+
+  module TK = TensorKanren(AddMulTensorSemiring)
+  open TK
+
+  let failo : rel = {
+    name = "failo";
+    args = [];
+    body = Fail }
+
+  let ex_coin_flip : tk_prgm = [
+    { name = "maino";
+      args = [bool_adt];
+      body =
+        Disj (
+          Conj (
+            Factor 0.5,
+            var_has_val (0, bool_adt) true_adv),
+          Conj (
+            Factor 0.5,
+            var_has_val (0, bool_adt) false_adv)) }]
+
+  let ex_infinite_coin_flip : tk_prgm = [
+    { name = "maino";
+      args = [];
+      body = Disj (
+        Factor 0.5,
+        Conj (
+          Factor 0.5,
+          Rel ("maino", []))) }]
+
+  let examples = [
+    ("ex_coin_flip", ex_coin_flip);
+    ("ex_infinite_coin_flip", ex_infinite_coin_flip)
+  ]
+
+end
+
