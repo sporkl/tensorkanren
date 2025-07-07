@@ -1493,4 +1493,55 @@ module SatTKEx = struct
             var_has_val (0, nat_adt 3) (nat_adv 3 2),
             var_has_val (1, nat_adt 3) (nat_adv 3 0)))}]
 
+  let ex_sudoku : tk_prgm = [
+    { name = "valid_4x4";
+      args = [nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4];
+      body =
+        conj [
+          Neqo ((0, nat_adt 4), (1, nat_adt 4));
+          Neqo ((0, nat_adt 4), (2, nat_adt 4));
+          Neqo ((0, nat_adt 4), (3, nat_adt 4));
+          Neqo ((1, nat_adt 4), (2, nat_adt 4));
+          Neqo ((1, nat_adt 4), (3, nat_adt 4));
+          Neqo ((2, nat_adt 4), (3, nat_adt 4))
+        ]};
+    { name = "sudoku_4x4";
+      args = [
+        nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; 
+        nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4
+      ];
+      body =
+        conj [
+          Rel ("valid_4x4", [(0, nat_adt 4); (1, nat_adt 4); (2, nat_adt 4); (3, nat_adt 4)]);
+          Rel ("valid_4x4", [(0, nat_adt 4); (1, nat_adt 4); (4, nat_adt 4); (5, nat_adt 4)]);
+          Rel ("valid_4x4", [(0, nat_adt 4); (4, nat_adt 4); (8, nat_adt 4); (12, nat_adt 4)]);
+          Rel ("valid_4x4", [(8, nat_adt 4); (9, nat_adt 4); (12, nat_adt 4); (13, nat_adt 4)]);
+          Rel ("valid_4x4", [(8, nat_adt 4); (9, nat_adt 4); (10, nat_adt 4); (11, nat_adt 4)]);
+          Rel ("valid_4x4", [(10, nat_adt 4); (11, nat_adt 4); (14, nat_adt 4); (15, nat_adt 4)]);
+          Rel ("valid_4x4", [(12, nat_adt 4); (13, nat_adt 4); (14, nat_adt 4); (15, nat_adt 4)]);
+          Rel ("valid_4x4", [(1, nat_adt 4); (5, nat_adt 4); (9, nat_adt 4); (13, nat_adt 4)]);
+          Rel ("valid_4x4", [(4, nat_adt 4); (5, nat_adt 4); (6, nat_adt 4); (7, nat_adt 4)]);
+          Rel ("valid_4x4", [(2, nat_adt 4); (3, nat_adt 4); (6, nat_adt 4); (7, nat_adt 4)]);
+          Rel ("valid_4x4", [(3, nat_adt 4); (7, nat_adt 4); (11, nat_adt 4); (15, nat_adt 4)]);
+          Rel ("valid_4x4", [(2, nat_adt 4); (6, nat_adt 4); (10, nat_adt 4); (14, nat_adt 4)])]};
+    { name = "maino";
+      args = [
+        nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; 
+        nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4; nat_adt 4
+      ];
+      body =
+        conj [
+          var_has_val (0, nat_adt 4) (nat_adv 4 3);
+          var_has_val (2, nat_adt 4) (nat_adv 4 0);
+          var_has_val (13, nat_adt 4) (nat_adv 4 0);
+          var_has_val (15, nat_adt 4) (nat_adv 4 2);
+          Rel ("sudoku_4x4",
+            [(0, nat_adt 4); (1, nat_adt 4); (2, nat_adt 4); (3, nat_adt 4); 
+              (4, nat_adt 4); (5, nat_adt 4); (6, nat_adt 4); (7, nat_adt 4); 
+              (8, nat_adt 4); (9, nat_adt 4); (10, nat_adt 4); (11, nat_adt 4); 
+              (12, nat_adt 4); (13, nat_adt 4); (14, nat_adt 4); (15, nat_adt 4)])]}]
+   (* (sudoku_4x4 3 b 0 d e f g h i j k l m 0 o 2))) *)
+
+
+
 end
