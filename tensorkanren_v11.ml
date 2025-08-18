@@ -192,6 +192,13 @@ module TK = struct
       (fun acc x -> acc + (adt_size x))
       0
       env
+  (* create freshes with given type *)
+  let rec create_freshes (ts : adt list) (body : 'elt tk) : 'elt tk =
+    match ts with
+    | [] -> body
+    | at :: dts ->
+        create_freshes dts (Fresh (at, body))
+
 
   (* COMPILING ADTS TO BITSTRINGS *)
 
@@ -245,80 +252,50 @@ module TK = struct
                 enforce_var_type (0, yt) bt))))
     | _ -> invalid_arg "Var has improperly compiled type!"
 
+  let rec count_adt_bools (t : adt) : int =
+    match t with
+    | Unit -> 0
+    | Sum (Unit, Unit) -> 1
+    | Prod (at, bt) -> (count_adt_bools at) + (count_adt_bools bt)
+    | _ -> invalid_arg "passed type must be compiled"
+
+  (* unifies an adt with bool vars with debruijn indices in given inclusive range *)
+  let rec unify_adt_bools (x : var) (first_bv : int) (num_bv : int) : 'elt tk =
+    let xv, xt = x in
+    match xt with
+    | Unit -> Succeed
+    | Sum (Unit, Unit) ->
+        if num_bv = 0 then
+          trueo x (* force to a single value *)
+        else
+          Eqo (x, (first_bv, bool_adt))
+    | Prod (xt, yt) ->
+        let xt_num_bools = count_adt_bools xt in
+        Fresh (xt,
+          Fresh (yt,
+            Conj (
+              Pairo ((xv + 2, xt), (1, xt), (0, yt)),
+              Conj (
+                unify_adt_bools
+                  (1, xt) (first_bv + 2) xt_num_bools,
+                unify_adt_bools
+                  (0, yt) (first_bv + 2 + xt_num_bools) (num_bv - xt_num_bools)))))
+    | _ -> invalid_arg "passed type must be compiled"
+
   (* assumes both source and target are (potentially different) compiled versions *)
   (* generates code so that they both hold the same value *)
-  (* unifying with Unit doesn't require a variable, so use -1 dummy variable. shouldn't make it to output *)
-  (* not 100% sure of correctness for cases when unifying bool with prod *)
-  let rec coerced_unify (x : var) (y : var) : 'elt tk =
-    let xv, xt = x in
-    let yv, yt = y in
-    match xt, yt with
-    | Unit, Unit -> Succeed
-    | Unit, Sum (Unit, Unit) -> trueo y
-    | Unit, Prod (yat, ydt) ->
-        Fresh (yat,
-          Fresh (ydt,
-            Conj (
-              Pairo ((yv + 2, yt), (1, yat), (0, ydt)),
-              Conj (
-                coerced_unify (-1, Unit) (1, yat),
-                coerced_unify (-1, Unit) (0, ydt)))))
-    | Sum (Unit, Unit), Unit -> trueo x
-    | Sum (Unit, Unit), Sum (Unit, Unit) -> Eqo (x, y)
-    | Sum (Unit, Unit), Prod (yat, ydt) ->
-        if adt_size yat > 1 then
-          Fresh (yat,
-            Fresh (ydt,
-              Conj (
-                Pairo ((yv + 2, yt), (1, yat), (0, ydt)),
-                Conj (
-                  coerced_unify (xv + 2, xt) (1, yat),
-                  coerced_unify (-1, Unit) (0, ydt)))))
-        else
-          Fresh (yat,
-            Fresh (ydt,
-              Conj (
-                Pairo ((yv + 2, yt), (1, yat), (0, ydt)),
-                Conj (
-                  coerced_unify (-1, Unit) (1, yat),
-                  coerced_unify (xv + 2, xt) (0, ydt)))))
-    | Prod (xat, xdt), Unit ->
-        Fresh (xat,
-          Fresh (xdt,
-            Conj (
-              Pairo ((xv + 2, xt), (1, xat), (0, xdt)),
-              Conj (
-                coerced_unify (1, xat) (-1, Unit),
-                coerced_unify (0, xdt) (-1, Unit)))))
-    | Prod (xat, xdt), Sum (Unit, Unit) ->
-        if adt_size xat > 1 then
-          Fresh (xat,
-            Fresh (xdt,
-              Conj (
-                Pairo ((xv + 2, xt), (1, xat), (0, xdt)),
-                Conj (
-                  coerced_unify (1, xat) (yv + 2, yt),
-                  coerced_unify (0, xdt) (-1, Unit)))))
-        else
-          Fresh (xat,
-            Fresh (xdt,
-              Conj (
-                Pairo ((xv + 2, xt), (1, xat), (0, xdt)),
-                Conj (
-                  coerced_unify (1, xat) (-1, Unit),
-                  coerced_unify (0, xdt) (yv + 2, yt)))))
-    | Prod (xat, xdt), Prod (yat, ydt) ->
-        Fresh (xat,
-          Fresh (xdt,
-            Fresh (yat,
-              Fresh (ydt,
-                Conj (
-                  Conj (
-                    Pairo ((xv + 4, xt), (3, xat), (2, xdt)),
-                    Pairo ((yv + 4, yt), (1, yat), (0, ydt))),
-                  Conj (
-                    coerced_unify (3, xat) (1, yat),
-                    coerced_unify (2, xdt) (0, ydt)))))))
+  let rec coerced_unify (a : var) (b : var) =
+    let av, at = a in
+      let bv, bt = b in
+    if (adt_size at) > (adt_size bt) then
+      coerced_unify b a (* first variable should be smaller *)
+    else
+      let num_bools = count_adt_bools at in
+      create_freshes
+        (List.init num_bools (fun _ -> bool_adt))
+        (Conj (
+          unify_adt_bools (av + num_bools, at) 0 num_bools,
+          unify_adt_bools (bv + num_bools, bt) 0 num_bools))
 
   let rec compile_tk (e : 'elt tk) : 'elt tk =
     match e with
@@ -1007,6 +984,30 @@ module MaxAddTKEx = struct
       args = [nat_adt 4; nat_adt 4];
       body = Neqo ((0, nat_adt 4), (1, nat_adt 4))}]
 
+  let ex_coerced_unify : tk_prgm = [
+    falseo;
+    { name = "maino";
+      args = [bool_adt];
+      body = 
+        Fresh (Prod (Prod (bool_adt, bool_adt), bool_adt),
+          Fresh (Prod (bool_adt, bool_adt),
+            Fresh (Prod (bool_adt, Prod (bool_adt, bool_adt)),
+              Fresh (Prod (bool_adt, bool_adt),
+                Fresh (bool_adt,
+                  Fresh (bool_adt,
+                    Fresh (bool_adt,
+                      conj [
+                        Pairo ((4, Prod (Prod (bool_adt, bool_adt), bool_adt)),
+                          (2, bool_adt), (3, Prod (bool_adt, bool_adt)));
+                        Pairo ((3, Prod (bool_adt, bool_adt)),
+                          (1, bool_adt), (0, bool_adt));
+                        Rel ("falseo", [(0, bool_adt)]);
+                        coerced_unify
+                          (4, Prod (Prod (bool_adt, bool_adt), bool_adt))
+                          (6, Prod (bool_adt, Prod (bool_adt, bool_adt)));
+                        Pairo ((6, Prod (bool_adt, Prod (bool_adt, bool_adt))),
+                          (5, Prod (bool_adt, bool_adt)), (7, bool_adt))])))))))}]
+
   (* run tests *)
 
   let test_examples () =
@@ -1160,6 +1161,9 @@ module MaxAddTKEx = struct
           [|one; zero; zero; zero; one; zero; zero; one|];
           [|one; zero; zero; zero; one; zero; one; zero|]|]));
 
+    print_endline "ex_coerced_unify";
+    assert ((etpm ex_coerced_unify).body = (of_array [|zero; one|]));
+
     ()
 
 end
@@ -1221,12 +1225,6 @@ end
 module SatTK = struct
 
   open TK
-
-  let rec create_freshes (ts : adt list) (body : 'elt tk) : 'elt tk =
-    match ts with
-    | [] -> body
-    | at :: dts ->
-        create_freshes dts (Fresh (at, body))
 
   let rec bind_vars (avs : var list) (bvs : var list) : 'elt tk =
     match avs, bvs with
